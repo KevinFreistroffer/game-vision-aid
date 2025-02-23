@@ -126,6 +126,9 @@ class BetterCamEnhanced:
     def show_live_feed(self, model=None, model_type=None, overlay_color=None, device=None):
         """Show live feed with object detection overlay."""
         try:
+            cv2.namedWindow("BetterCam Live Feed", cv2.WINDOW_NORMAL)
+            print(Fore.GREEN + "Starting live feed...")
+
             while self.is_capturing:
                 frame = self.grab_frame()
                 if frame is not None:
