@@ -19,13 +19,16 @@ class BetterCamEnhanced:
         self.target_fps = target_fps
         self.region = region
         self.is_capturing = False
+        self.buffer = []
         self._frame_count = 0
         self._start_time = time.time()
-        self.window_name = "BetterCam Live Feed"
+        self.backSub = cv2.createBackgroundSubtractorMOG2()  # Background subtractor
+        self.prev_frame = None  # Store previous frame
         self._last_frame = None
         self._frame_retry_count = 0
         self._max_retries = 3
         self._init_time = 1.0  # Time to wait after initialization
+        self.window_name = "BetterCam Live Feed"
 
     def start(self):
         """Start screen capture with proper initialization."""
@@ -124,7 +127,7 @@ class BetterCamEnhanced:
             return self._last_frame
 
     def show_live_feed(self, model=None, model_type=None, overlay_color=None, device=None):
-        """Show live feed with object detection overlay."""
+        """Show live feed with object detection."""
         try:
             cv2.namedWindow("BetterCam Live Feed", cv2.WINDOW_NORMAL)
             print(Fore.GREEN + "Starting live feed...")
@@ -136,71 +139,74 @@ class BetterCamEnhanced:
                         # Convert BGRA to BGR for OpenCV
                         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                         
-                        # Perform detection if model is provided
-                        if model is not None:
-                            # Convert frame to RGB for PyTorch model
-                            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                            
-                            # Resize frame to match YOLOv5's expected input size (640x640)
-                            input_size = 640
-                            original_height, original_width = frame_rgb.shape[:2]
-                            
-                            # Calculate resize scale while maintaining aspect ratio
-                            scale = min(input_size / original_width, input_size / original_height)
-                            new_width = int(original_width * scale)
-                            new_height = int(original_height * scale)
-                            
-                            # Resize image
-                            resized = cv2.resize(frame_rgb, (new_width, new_height))
-                            
-                            # Create square image with padding
-                            square_img = np.zeros((input_size, input_size, 3), dtype=np.uint8)
-                            dx = (input_size - new_width) // 2
-                            dy = (input_size - new_height) // 2
-                            square_img[dy:dy+new_height, dx:dx+new_width] = resized
-                            
-                            # Convert to tensor with proper memory format
-                            frame_tensor = torch.from_numpy(square_img.copy()).to(device)
-                            frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0).float() / 255.0
-                            frame_tensor = frame_tensor.contiguous()  # Ensure tensor is contiguous
-                            
-                            # Perform inference
-                            with torch.no_grad():
-                                try:
-                                    results = model(frame_tensor)
-                                    
-                                    # Store scale and padding info
-                                    scale_info = {
-                                        'scale': scale,
-                                        'pad': (dx, dy),
-                                        'original_size': (original_width, original_height)
-                                    }
-                                    
-                                    # Draw detections
-                                    frame_bgr = self.draw_detections(frame_bgr, results, overlay_color, scale_info)
-                                except Exception as e:
-                                    print(Fore.RED + f"Inference error: {e}")
+                        # Apply background subtraction
+                        fg_mask = self.backSub.apply(frame_bgr)
+                        
+                        # Apply threshold to remove shadows
+                        _, mask_thresh = cv2.threshold(fg_mask, 180, 255, cv2.THRESH_BINARY)
+                        
+                        # Apply morphological operations
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                        mask_cleaned = cv2.morphologyEx(mask_thresh, cv2.MORPH_OPEN, kernel)
+                        
+                        # Find contours
+                        contours, _ = cv2.findContours(mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        # Filter contours by size
+                        min_contour_area = 500
+                        large_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_contour_area]
+                        
+                        # Draw boxes around moving objects
+                        for cnt in large_contours:
+                            x, y, w, h = cv2.boundingRect(cnt)
+                            cv2.rectangle(frame_bgr, (x, y), (x+w, y+h), overlay_color, 2)
+                            cv2.putText(frame_bgr, 'Moving Object', (x, y-10),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, overlay_color, 2)
+                        
+                        # Perform YOLOv5 detection if model is provided
+                        if model is not None and model_type is not None:
+                            try:
+                                # Convert frame to RGB for model
+                                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                                frame_resized = cv2.resize(frame_rgb, (640, 640))
+                                
+                                # Convert to tensor
+                                input_tensor = torch.from_numpy(frame_resized).to(device)
+                                input_tensor = input_tensor.permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                                
+                                # Run inference
+                                with torch.inference_mode():
+                                    results = model(input_tensor)
+                                
+                                # Draw YOLOv5 detections
+                                frame_bgr = self.draw_detections(frame_bgr, results, overlay_color, model_type)
+                                
+                            except Exception as e:
+                                print(Fore.RED + f"Detection error: {e}")
 
                         # Display the frame
-                        cv2.imshow(self.window_name, frame_bgr)
+                        cv2.imshow("BetterCam Live Feed", frame_bgr)
+                        
+                        # Debug: Show the mask
+                        cv2.imshow("Motion Mask", mask_cleaned)
 
                     except Exception as e:
                         print(Fore.RED + f"Frame processing error: {e}")
 
-                # Check for 'q' key press
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    print(Fore.YELLOW + "Exiting live feed...")
-                    break
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
-                # Small delay to prevent high CPU usage
-                time.sleep(0.001)
+                else:
+                    time.sleep(0.01)
 
         except KeyboardInterrupt:
             print(Fore.YELLOW + "Live feed interrupted.")
         finally:
-            self.cleanup()
+            self.stop()
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
 
-    def draw_detections(self, frame, results, color, scale_info):
+    def draw_detections(self, frame, results, color, model_type):
         """Draw detection boxes for relevant classes."""
         try:
             # Classes we want to detect
@@ -220,15 +226,9 @@ class BetterCamEnhanced:
 
             confidence_threshold = 0.4  # Adjust this threshold as needed
 
-            # Get scaling info
-            scale = scale_info['scale']
-            pad_x, pad_y = scale_info['pad']
-            original_width, original_height = scale_info['original_size']
-
-            # Process detections - handle YOLOv5 results format
-            if hasattr(results, 'pred') and len(results.pred) > 0:
+            if model_type == 'torch':
                 detections = results.pred[0].cpu().numpy()
-            elif isinstance(results, (list, tuple)) and len(results) > 0:
+            elif model_type == 'onnx':
                 detections = results[0].cpu().numpy()
             else:
                 return frame  # Return original frame if no detections
@@ -241,16 +241,10 @@ class BetterCamEnhanced:
                     if class_id in target_classes and confidence > confidence_threshold:
                         # Get coordinates and scale back to original size
                         try:
-                            x1 = int((float(detection[0]) - pad_x) / scale)
-                            y1 = int((float(detection[1]) - pad_y) / scale)
-                            x2 = int((float(detection[2]) - pad_x) / scale)
-                            y2 = int((float(detection[3]) - pad_y) / scale)
-                            
-                            # Ensure coordinates are within frame bounds
-                            x1 = max(0, min(x1, original_width - 1))
-                            y1 = max(0, min(y1, original_height - 1))
-                            x2 = max(0, min(x2, original_width - 1))
-                            y2 = max(0, min(y2, original_height - 1))
+                            x1 = int(float(detection[0]))
+                            y1 = int(float(detection[1]))
+                            x2 = int(float(detection[2]))
+                            y2 = int(float(detection[3]))
                             
                             # Draw box
                             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
