@@ -132,70 +132,75 @@ class BetterCamEnhanced:
             cv2.namedWindow("BetterCam Live Feed", cv2.WINDOW_NORMAL)
             print(Fore.GREEN + "Starting live feed...")
 
+            # Initialize background subtractor with adjusted parameters
+            self.backSub = cv2.createBackgroundSubtractorMOG2(
+                history=50,           # Shorter history for better responsiveness
+                varThreshold=20,      # Lower threshold to detect full figures
+                detectShadows=False   # Disable shadows to reduce noise
+            )
+
             while self.is_capturing:
                 frame = self.grab_frame()
                 if frame is not None:
                     try:
                         # Convert BGRA to BGR for OpenCV
                         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                        frame_display = frame_bgr.copy()
                         
                         # Apply background subtraction
                         fg_mask = self.backSub.apply(frame_bgr)
                         
-                        # Apply threshold to remove shadows
-                        _, mask_thresh = cv2.threshold(fg_mask, 180, 255, cv2.THRESH_BINARY)
+                        # Apply threshold with lower value to catch more of the figure
+                        _, mask_thresh = cv2.threshold(fg_mask, 127, 255, cv2.THRESH_BINARY)
                         
-                        # Apply morphological operations
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                        mask_cleaned = cv2.morphologyEx(mask_thresh, cv2.MORPH_OPEN, kernel)
+                        # Apply morphological operations to connect body parts
+                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))  # Larger kernel
+                        mask_cleaned = cv2.morphologyEx(mask_thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_OPEN, kernel)
                         
                         # Find contours
                         contours, _ = cv2.findContours(mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         
-                        # Filter contours by size
-                        min_contour_area = 500
-                        large_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_contour_area]
+                        # Filter and draw contours
+                        min_area = 1500       # Minimum area for a character
+                        max_area = 100000     # Maximum area to avoid huge detections
+                        min_height = 40       # Minimum height for a character
+                        max_height = 400      # Maximum height for a character
                         
-                        # Draw boxes around moving objects
-                        for cnt in large_contours:
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            cv2.rectangle(frame_bgr, (x, y), (x+w, y+h), overlay_color, 2)
-                            cv2.putText(frame_bgr, 'Moving Object', (x, y-10),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, overlay_color, 2)
+                        for cnt in contours:
+                            area = cv2.contourArea(cnt)
+                            if min_area < area < max_area:
+                                x, y, w, h = cv2.boundingRect(cnt)
+                                
+                                # Calculate aspect ratio (width/height)
+                                aspect_ratio = float(w)/h
+                                
+                                # Filter for humanoid proportions and minimum height
+                                if (0.2 < aspect_ratio < 0.8 and 
+                                    min_height < h < max_height):
+                                    
+                                    # Expand box slightly to ensure full coverage
+                                    expand_x = int(w * 0.1)  # Expand width by 10%
+                                    expand_y = int(h * 0.1)  # Expand height by 10%
+                                    
+                                    x1 = max(0, x - expand_x)
+                                    y1 = max(0, y - expand_y)
+                                    x2 = min(frame_bgr.shape[1], x + w + expand_x)
+                                    y2 = min(frame_bgr.shape[0], y + h + expand_y)
+                                    
+                                    # Draw the expanded box
+                                    cv2.rectangle(frame_display, (x1, y1), (x2, y2), overlay_color, 2)
                         
-                        # Perform YOLOv5 detection if model is provided
-                        if model is not None and model_type is not None:
-                            try:
-                                # Convert frame to RGB for model
-                                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                                frame_resized = cv2.resize(frame_rgb, (640, 640))
-                                
-                                # Convert to tensor
-                                input_tensor = torch.from_numpy(frame_resized).to(device)
-                                input_tensor = input_tensor.permute(2, 0, 1).unsqueeze(0).float() / 255.0
-                                
-                                # Run inference
-                                with torch.inference_mode():
-                                    results = model(input_tensor)
-                                
-                                # Draw YOLOv5 detections
-                                frame_bgr = self.draw_detections(frame_bgr, results, overlay_color, model_type)
-                                
-                            except Exception as e:
-                                print(Fore.RED + f"Detection error: {e}")
+                        # Show the main window
+                        cv2.imshow("BetterCam Live Feed", frame_display)
 
-                        # Display the frame
-                        cv2.imshow("BetterCam Live Feed", frame_bgr)
-                        
-                        # Debug: Show the mask
-                        cv2.imshow("Motion Mask", mask_cleaned)
+                        # Check for quit
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
 
                     except Exception as e:
                         print(Fore.RED + f"Frame processing error: {e}")
-
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-
+                        continue
                 else:
                     time.sleep(0.01)
 
